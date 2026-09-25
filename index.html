@@ -3679,6 +3679,128 @@ function openPrintPreview(type, id){
   goTo('printPreview');
 }
 function closePrintPreview(back){ printDoc = null; setScreen(back||'dashboard'); }
+// A tiny, dependency-free PDF writer good enough for a one-page bill: built-in fonts only
+// (no embedding, no CDN), so it works with zero internet -- exactly the offline case this
+// exists for. Base-14 fonts have no ₹ glyph, so amounts render as "Rs." inside the PDF only;
+// on-screen and WhatsApp text messages keep using ₹ as before.
+function esc(s){return String(s).replace(/\\/g,'\\\\').replace(/\(/g,'\\(').replace(/\)/g,'\\)');}
+// PDF's Tj operator needs single-byte WinAnsi-style text, not UTF-8 -- any multi-byte
+// character (₹, —, •, curly quotes...) silently corrupts if passed through raw. Normalise
+// the common ones to a real character, then hard-strip anything else so this can never
+// happen again even for text nobody thought to test (a customer name, a typo, anything).
+function pdfSafe(s){
+  return String(s)
+    .replace(/₹/g,'Rs.').replace(/[–—]/g,'-').replace(/[•·]/g,'-')
+    .replace(/[’‘]/g,"'").replace(/[“”]/g,'"').replace(/…/g,'...')
+    .replace(/[^\x20-\x7E]/g,'?');
+}
+
+function buildBillPdf({shop,docTitle,badge,refLine,rows,totalsLines,footer}){
+  const W=595,H=842,M=48; let y=H-M;
+  const ops=[];
+  const put=(text,{x=M,size=10,bold=false,color=[0.05,0.05,0.08],dy=16}={})=>{
+    y-=dy; if(!text)return;
+    ops.push(`q ${color.join(' ')} rg BT /${bold?'F2':'F1'} ${size} Tf ${x} ${y} Td (${esc(pdfSafe(text))}) Tj ET Q`);
+  };
+  const rule=(dy=10)=>{y-=dy;ops.push(`0.7 G ${M} ${y} m ${W-M} ${y} l S`);y-=4;};
+
+  put(shop.name||'Hammad World',{size:16,bold:true,dy:22});
+  if(shop.gstin)put('GSTIN: '+shop.gstin,{size:9,color:[0.35,0.35,0.4]});
+  if(shop.address||shop.phone)put([shop.address,shop.phone].filter(Boolean).join('  •  '),{size:9,color:[0.35,0.35,0.4]});
+  rule(14);
+  put(docTitle,{size:12,bold:true,dy:18});
+  if(badge)put(badge,{size:10,bold:true,color:[0.6,0.35,0],dy:16});
+  if(refLine)put(refLine,{size:10,color:[0.2,0.2,0.25]});
+  rule(12);
+  put('Item'.padEnd(34)+'Qty'.padEnd(12)+'Rate'.padEnd(10)+'Amount',{size:9,bold:true,color:[0.4,0.4,0.45],dy:16});
+  for(const r of rows)put(r.name.padEnd(34).slice(0,34)+String(r.qty).padEnd(12).slice(0,12)+String(r.rate).padEnd(10).slice(0,10)+r.amount,{size:9.5,dy:15});
+  rule(10);
+  for(const t of totalsLines)put(t.label.padEnd(30)+t.value,{size:t.grand?11:10,bold:!!t.grand,dy:t.grand?18:15});
+  if(footer){rule(10);put(footer,{size:8,color:[0.45,0.45,0.5],dy:14});}
+
+  const content=ops.join('\n');
+  const objects=[];
+  objects.push('<< /Type /Catalog /Pages 2 0 R >>');
+  objects.push('<< /Type /Pages /Kids [3 0 R] /Count 1 >>');
+  objects.push(`<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /MediaBox [0 0 ${W} ${H}] /Contents 4 0 R >>`);
+  const contentBytes=new TextEncoder().encode(content);
+  objects.push(null); // placeholder for stream object, built specially below
+  objects.push('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>');
+  objects.push('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>');
+
+  const enc=new TextEncoder();const parts=[];let offset=0;const offsets=[0];
+  const push=str=>{const b=enc.encode(str);parts.push(b);offset+=b.length;};
+  push('%PDF-1.4\n');
+  for(let i=0;i<objects.length;i++){
+    offsets.push(offset);
+    if(i===3){ // the content-stream object
+      push(`4 0 obj << /Length ${contentBytes.length} >> stream\n`);
+      parts.push(contentBytes);offset+=contentBytes.length;
+      push('\nendstream endobj\n');
+    } else {
+      push(`${i+1} 0 obj ${objects[i]} endobj\n`);
+    }
+  }
+  const xrefStart=offset;
+  push(`xref\n0 ${objects.length+1}\n0000000000 65535 f \n`);
+  for(let i=1;i<=objects.length;i++)push(String(offsets[i]).padStart(10,'0')+' 00000 n \n');
+  push(`trailer << /Size ${objects.length+1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`);
+  const total=parts.reduce((n,p)=>n+p.length,0);
+  const out=new Uint8Array(total);let pos=0;for(const p of parts){out.set(p,pos);pos+=p.length;}
+  return out;
+}
+
+/* Builds the SAME data a bill/receipt already shows on screen (see renderPrintPreview),
+   reused here only to lay it out as a real PDF file instead of HTML, so it can be shared as
+   an attachment. Kept as its own function so the working, already-tested print/HTML path is
+   never touched. */
+function billPdfRecord(type,id){
+  const shop=db.shopInfo||{name:'Hammad World'};
+  let record,docTitle,refLine,badge='';
+  if(type==='purchase'){record=db.purchases.find(p=>p.id===id);docTitle='Purchase Bill';refLine='Supplier: '+(record?record.supplier:'')+(record&&record.supplierBillNo?' - Their bill no: '+record.supplierBillNo:'');}
+  else if(type==='sale'){record=db.sales.find(s=>s.id===id);docTitle='Sale Bill';refLine='Customer: '+(record?record.customer:'');}
+  else if(type==='purchaseReturn'){record=db.purchaseReturns.find(r=>r.id===id);docTitle='Purchase Return / Debit Note';refLine='Return to distributor';}
+  else if(type==='saleReturn'){record=db.saleReturns.find(r=>r.id===id);docTitle='Sale Return / Credit Note';refLine='Against bill: '+(record?record.refSaleId:'');}
+  else if(type==='quotation'){record=(db.quotations||[]).find(q=>q.id===id);docTitle='Quotation / Estimate';refLine='For: '+(record?record.customer:'');}
+  else if(type==='pendingSale'){
+    const entry=hwQueue.find(e=>e.operationId===id);
+    if(entry){const d=entry.draft;const totals=saleTotals(d.items||[],d);
+      record={...d,items:d.items||[],billNo:'',date:new Date(entry.queuedAt).toISOString().slice(0,10),totalAmount:totals.totalAmount,totalGst:totals.totalGst,additionalChargesTotal:totals.additionalChargesTotal,billDiscountPct:totals.billDiscountPct};}
+    docTitle='Sale Bill';refLine='Customer: '+(entry?entry.draft.customer||'Walk-in':'');badge='PROVISIONAL - pending confirmation';
+  }
+  if(!record)return null;
+  const isQuotation=(type==='quotation'),isPurchaseSide=(type==='purchase'||type==='purchaseReturn');
+  const items=record.items||[];
+  const rows=items.map(it=>{
+    if(isPurchaseSide){const gst=it.gst||0,amt=incomingAmount(it);return {name:it.itemName+(it.batch?' ('+it.batch+')':''),qty:incomingQuantityLabel(it),rate:incomingRateLabel(it),amount:fmt(amt)};}
+    const boxQty=it.boxQty||0,pieceQty=it.pieceQty||0,boxPrice=it.boxPrice||0,piecePrice=it.piecePrice||0,gst=it.gst||0;
+    const raw=boxQty*boxPrice+pieceQty*piecePrice;
+    const amt=type==='saleReturn'&&it.lineTotal!=null?it.lineTotal:gstBreakdown(raw*(1-Number(it.discount||0)/100)*(1-Number(record.billDiscountPct||0)/100),gst,record.gstMode||'included').total;
+    return {name:it.itemName+(it.batch?' ('+it.batch+')':''),qty:boxQty+(pieceQty?' box +'+pieceQty+'pc':' box'),rate:fmt(boxPrice),amount:fmt(amt)};
+  });
+  const taxable=isQuotation?(record.total||0):(record.totalAmount||0);
+  const gstAmt=isQuotation?0:(record.totalGst||0);
+  const charges=record.additionalChargesTotal||0;
+  const inclusive=(type==='sale'||type==='saleReturn'||type==='pendingSale'||isQuotation);
+  const totalAlreadyIncludesCharges=(type==='sale'||type==='pendingSale');
+  const grand=totalAlreadyIncludesCharges?taxable:(inclusive?taxable+charges:taxable+gstAmt+charges);
+  const taxableDisplay=totalAlreadyIncludesCharges?(taxable-gstAmt-charges):(inclusive?taxable-gstAmt:taxable);
+  const totalsLines=[{label:'Taxable value',value:fmt(taxableDisplay)},{label:'GST'+(inclusive?' (included above)':''),value:fmt(gstAmt)}];
+  if(charges>0)totalsLines.push({label:'Additional charges',value:fmt(charges)});
+  totalsLines.push({label:'Total',value:fmt(grand),grand:true});
+  return {shop,docTitle:(type==='pendingSale'?docTitle:docTitle)+(record.billNo?' '+record.billNo:''),badge,refLine,rows,totalsLines,
+    footer:type==='pendingSale'?'Provisional total. The official bill number is confirmed once this device is back online.':'Line totals reflect discounts and tax. This is a system-generated document from '+(shop.name||'Hammad World')+'.'};
+}
+async function shareBillPdf(type,id){
+  const data=billPdfRecord(type,id);if(!data){alert('Document not found.');return;}
+  const bytes=buildBillPdf(data);
+  const file=new File([bytes],(data.docTitle||'bill').replace(/[^A-Za-z0-9 _-]/g,'')+'.pdf',{type:'application/pdf'});
+  if(navigator.canShare && navigator.canShare({files:[file]})){
+    try{await navigator.share({files:[file],title:data.docTitle});return;}catch(e){if(e&&e.name==='AbortError')return;}
+  }
+  alert('Your browser can\'t attach a file directly. Use "Print / Save as PDF" below, then attach that file in WhatsApp yourself.');
+}
+window.shareBillPdf=shareBillPdf;
 function printNow(){ window.print(); }
 function saleShareText(sale){
   const shop=db.shopInfo||{}, lines=[shop.name||'Hammad World'];
@@ -3701,9 +3823,12 @@ function getSaleForShare(id){
   if(!sale)throw Error('Sale bill not found.');
   return sale;
 }
-function shareSaleWhatsApp(id){
+async function shareSaleWhatsApp(id){
   try{
     const sale=getSaleForShare(id), text=saleShareText(sale);
+    const data=billPdfRecord('sale',id);
+    if(data){const file=new File([buildBillPdf(data)],'SaleBill.pdf',{type:'application/pdf'});
+      if(navigator.canShare&&navigator.canShare({files:[file]})){try{await navigator.share({files:[file],title:'Sale bill '+(sale.billNo||sale.id),text});return;}catch(e){if(e&&e.name==='AbortError')return;}}}
     window.open('https://wa.me/?text='+encodeURIComponent(text),'_blank','noopener,noreferrer');
   }catch(e){alert(e.message);}
 }
@@ -3811,13 +3936,31 @@ function renderPrintPreview(){
     </div>
   `;
 }
-function shareProvisionalWhatsApp(id){
+function provisionalShareText(entry){
+  const d=entry.draft,shop=db.shopInfo||{},totals=saleTotals(d.items||[],d),lines=[shop.name||'Hammad World'];
+  lines.push('PROVISIONAL sale — pending confirmation','Date: '+new Date(entry.queuedAt).toISOString().slice(0,10),'Customer: '+(d.customer||'Walk-in'));
+  lines.push('');
+  (d.items||[]).forEach((it,idx)=>{
+    const boxes=Number(it.boxQty||0), pieces=Number(it.pieceQty||0);
+    const qty=(boxes?boxes+' box'+(boxes===1?'':'es'):'')+(boxes&&pieces?' + ':'')+(pieces?pieces+' piece'+(pieces===1?'':'s'):'');
+    const gross=boxes*Number(it.boxPrice||0)+pieces*Number(it.piecePrice||0);
+    const afterDiscount=gross*(1-Number(it.discount||0)/100);
+    lines.push((idx+1)+'. '+(it.itemName||'Item')+' — '+(qty||'0 pieces')+' — '+fmt(afterDiscount));
+  });
+  lines.push('', 'Total: '+fmt(totals.totalAmount||0));
+  lines.push('', 'This is a provisional total. The official bill number will be confirmed once this device is back online.');
+  if(shop.address)lines.push('Address: '+shop.address);
+  if(shop.phone)lines.push('Phone: '+shop.phone);
+  return lines.join('\n');
+}
+async function shareProvisionalWhatsApp(id){
   const entry=hwQueue.find(e=>e.operationId===id);if(!entry)return;
-  const d=entry.draft,totals=saleTotals(d.items||[],d);
-  const lines=(d.items||[]).map(it=>'- '+it.itemName+' × '+(it.boxQty||0)+(it.pieceQty?'+'+it.pieceQty+'pc':'')).join('%0A');
-  const phone=(d.customerPhone||'').replace(/[^0-9]/g,'');
-  const text=encodeURIComponent('Provisional receipt from '+(db.shopInfo?.name||'Hammad World')+' (pending confirmation):%0A'+lines.replace(/%0A/g,'\n')+'%0ATotal: '+fmt(totals.totalAmount)).replace(/%2520/g,'%20');
-  window.open('https://wa.me/'+(phone?phone+'?':'?')+'text='+encodeURIComponent('Provisional receipt from '+(db.shopInfo?.name||'Hammad World')+' (pending confirmation):\n'+(d.items||[]).map(it=>'- '+it.itemName+' x '+(it.boxQty||0)+(it.pieceQty?'+'+it.pieceQty+'pc':'')).join('\n')+'\nTotal: '+fmt(totals.totalAmount)),'_blank');
+  const phone=(entry.draft.customerPhone||'').replace(/[^0-9]/g,'');
+  const text=provisionalShareText(entry);
+  const data=billPdfRecord('pendingSale',id);
+  if(data){const file=new File([buildBillPdf(data)],'ProvisionalReceipt.pdf',{type:'application/pdf'});
+    if(navigator.canShare&&navigator.canShare({files:[file]})){try{await navigator.share({files:[file],title:'Provisional receipt',text});return;}catch(e){if(e&&e.name==='AbortError')return;}}}
+  window.open('https://wa.me/'+(phone?phone:'')+'?text='+encodeURIComponent(text),'_blank','noopener,noreferrer');
 }
 window.shareProvisionalWhatsApp=shareProvisionalWhatsApp;
 window.openPrintPreview = openPrintPreview;
@@ -3883,7 +4026,7 @@ document.addEventListener('keydown', function(e){
 });
 
 /* HAMMAD WORLD reliability revision 2026-09-18. Financial amounts are INR. */
-const HW_VERSION='2026.09.25-r26-offline-receipt';
+const HW_VERSION='2026.09.25-r28-whatsapp-pdf';
 let hwExpectedLocal=localStorage.getItem(DB_KEY), hwCloudReady=false, hwCloudError='', hwBusy=new Set(), hwPendingOpenings=[];
 const hwCollections=['stock','sales','purchases','saleReturns','purchaseReturns','openingStock','parties','payments','expenses','staff','staffLedger','quotations','auditLog'];
 // Staff subscribe to the shop records needed to verify deliveries and enter bills.
