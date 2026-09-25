@@ -2409,7 +2409,7 @@ function computeCatalogStatus(s){
 }
 /* Authenticated worker settings. Deploy the companion worker and use your existing endpoint below. */
 const R2_PUBLIC_BASE   = 'https://pub-ce2a5311865c4b9bbe03bb9309ba0a29.r2.dev/';
-const R2_WORKER_URL    = 'https://hammad-world-test.hammadworld25.workers.dev';
+const R2_WORKER_URL    = 'https://hammad-world-photo-upload.hammadworld25.workers.dev';
 /* Server-authoritative staff saves (MD-H01/H02 fix): staff bills go through the Worker,
    which re-reads current stock/sale state and recomputes totals/costs/return limits itself,
    instead of trusting whatever the phone sends. Owner saves are unchanged (direct to Firestore). */
@@ -3731,9 +3731,16 @@ function renderPrintPreview(){
   else if(type==='purchaseReturn'){ record = db.purchaseReturns.find(r=>r.id===id); docTitle='Purchase Return / Debit Note'; refLine='Return to distributor'; }
   else if(type==='saleReturn'){ record = db.saleReturns.find(r=>r.id===id); docTitle='Sale Return / Credit Note'; refLine='Against bill: '+escapeHtml(record?record.refSaleId:''); }
   else if(type==='quotation'){ record = (db.quotations||[]).find(q=>q.id===id); docTitle='Quotation / Estimate'; refLine='For: '+escapeHtml(record?record.customer:'')+(record&&record.validDays?' • Valid '+record.validDays+' days':''); }
+  else if(type==='pendingSale'){
+    const entry=hwQueue.find(e=>e.operationId===id);
+    if(entry){const d=entry.draft;const totals=saleTotals(d.items||[],d);
+      record={...d,items:d.items||[],billNo:'',date:new Date(entry.queuedAt).toISOString().slice(0,10),totalAmount:totals.totalAmount,totalGst:totals.totalGst,additionalChargesTotal:totals.additionalChargesTotal,billDiscountPct:totals.billDiscountPct};}
+    docTitle='Provisional Receipt'; refLine='Customer: '+escapeHtml(entry?entry.draft.customer||'Walk-in':'');
+  }
   if(!record) return `<div class="empty">Document not found.</div><button class="btn btn-ghost" onclick="closePrintPreview()">← Back</button>`;
 
   const isQuotation = (type==='quotation');
+  const isPendingSale = (type==='pendingSale');
   const isPurchaseSide = (type==='purchase' || type==='purchaseReturn');
   const items = record.items||[];
   const rows = items.map(it=>{
@@ -3753,14 +3760,14 @@ function renderPrintPreview(){
   const taxable = isQuotation ? (record.total||0) : (record.totalAmount||0);
   const gstAmt = isQuotation ? 0 : (record.totalGst||0);
   const charges = record.additionalChargesTotal||0;
-  const inclusive = (type==='sale' || type==='saleReturn' || isQuotation);
+  const inclusive = (type==='sale' || type==='saleReturn' || type==='pendingSale' || isQuotation);
   // A sale's stored totalAmount already has additional charges baked into
   // it (see saveSale: grandTotal = totalAmount+chargesTotal) — adding
   // `charges` again here double-counted them on the printed total (a Rs100
   // item + Rs20 delivery saved correctly as Rs120 but printed Rs140).
   // Purchases, quotations and returns don't have this double-inclusion, so
   // only the sale case needs the extra charges added separately.
-  const totalAlreadyIncludesCharges = (type==='sale');
+  const totalAlreadyIncludesCharges = (type==='sale' || type==='pendingSale');
   const grand = totalAlreadyIncludesCharges ? taxable : (inclusive ? taxable+charges : taxable+gstAmt+charges);
   const taxableDisplay = totalAlreadyIncludesCharges ? (taxable-gstAmt-charges) : (inclusive ? taxable-gstAmt : taxable);
   const billLogoSrc = document.querySelector('header.top .mark')?.getAttribute('src') || '';
@@ -3780,9 +3787,10 @@ function renderPrintPreview(){
           <div style="display:inline-block;margin-top:10px;font-size:12.5px;font-weight:700;background:var(--stone-200);padding:4px 12px;border-radius:20px;color:var(--clay-700);">${escapeHtml(docTitle)}</div>
         </div>
         <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--ink-500);margin-bottom:10px;border-bottom:1px dashed var(--line);padding-bottom:10px;">
-          <span>Doc no: <b style="color:var(--ink-900);">${escapeHtml(record.billNo||record.quoteNo||record.id)}</b></span>
+          <span>Doc no: <b style="color:var(--ink-900);">${isPendingSale?'Not yet assigned':escapeHtml(record.billNo||record.quoteNo||record.id)}</b></span>
           <span>Date: <b style="color:var(--ink-900);">${escapeHtml(record.date)}</b></span>
         </div>
+        ${isPendingSale?'<div style="background:#fff3cd;border:1px solid #f0c14b;border-radius:8px;padding:8px 10px;font-size:12px;font-weight:700;color:#7a5b00;text-align:center;margin-bottom:10px;">PROVISIONAL — not yet confirmed. Stock and the final bill number are assigned once this device is back online.</div>':''}
         <div class="step" style="margin-bottom:10px;">${refLine}</div>
         <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:10px;">
           <thead><tr><th style="text-align:left;font-size:10.5px;color:var(--ink-500);border-bottom:1.5px solid var(--line);padding:6px 4px;">Item</th><th style="text-align:right;font-size:10.5px;color:var(--ink-500);border-bottom:1.5px solid var(--line);padding:6px 4px;">Qty</th><th style="text-align:right;font-size:10.5px;color:var(--ink-500);border-bottom:1.5px solid var(--line);padding:6px 4px;">Rate</th><th style="text-align:right;font-size:10.5px;color:var(--ink-500);border-bottom:1.5px solid var(--line);padding:6px 4px;">GST</th><th style="text-align:right;font-size:10.5px;color:var(--ink-500);border-bottom:1.5px solid var(--line);padding:6px 4px;">Amount</th></tr></thead>
@@ -3799,9 +3807,19 @@ function renderPrintPreview(){
       <button class="btn btn-ghost" onclick="closePrintPreview()">← Back</button>
       <button class="btn btn-primary" onclick="printNow()">🖨 Print / Save as PDF</button>
       ${type==='sale' ? `<button class="btn btn-ghost" onclick="shareSaleWhatsApp('${inlineValue(id)}')">WhatsApp</button><button class="btn btn-ghost" onclick="shareSaleBill('${inlineValue(id)}')">Share bill</button>` : ''}
+      ${isPendingSale ? `<button class="btn btn-ghost" onclick="shareProvisionalWhatsApp('${inlineValue(id)}')">WhatsApp</button>` : ''}
     </div>
   `;
 }
+function shareProvisionalWhatsApp(id){
+  const entry=hwQueue.find(e=>e.operationId===id);if(!entry)return;
+  const d=entry.draft,totals=saleTotals(d.items||[],d);
+  const lines=(d.items||[]).map(it=>'- '+it.itemName+' × '+(it.boxQty||0)+(it.pieceQty?'+'+it.pieceQty+'pc':'')).join('%0A');
+  const phone=(d.customerPhone||'').replace(/[^0-9]/g,'');
+  const text=encodeURIComponent('Provisional receipt from '+(db.shopInfo?.name||'Hammad World')+' (pending confirmation):%0A'+lines.replace(/%0A/g,'\n')+'%0ATotal: '+fmt(totals.totalAmount)).replace(/%2520/g,'%20');
+  window.open('https://wa.me/'+(phone?phone+'?':'?')+'text='+encodeURIComponent('Provisional receipt from '+(db.shopInfo?.name||'Hammad World')+' (pending confirmation):\n'+(d.items||[]).map(it=>'- '+it.itemName+' x '+(it.boxQty||0)+(it.pieceQty?'+'+it.pieceQty+'pc':'')).join('\n')+'\nTotal: '+fmt(totals.totalAmount)),'_blank');
+}
+window.shareProvisionalWhatsApp=shareProvisionalWhatsApp;
 window.openPrintPreview = openPrintPreview;
 window.closePrintPreview = closePrintPreview;
 window.printNow = printNow;
@@ -3865,7 +3883,7 @@ document.addEventListener('keydown', function(e){
 });
 
 /* HAMMAD WORLD reliability revision 2026-09-18. Financial amounts are INR. */
-const HW_VERSION='2026.09.24-r25-staff-rules-tightened';
+const HW_VERSION='2026.09.25-r26-offline-receipt';
 let hwExpectedLocal=localStorage.getItem(DB_KEY), hwCloudReady=false, hwCloudError='', hwBusy=new Set(), hwPendingOpenings=[];
 const hwCollections=['stock','sales','purchases','saleReturns','purchaseReturns','openingStock','parties','payments','expenses','staff','staffLedger','quotations','auditLog'];
 // Staff subscribe to the shop records needed to verify deliveries and enter bills.
@@ -4124,7 +4142,7 @@ async function hwSyncQueueImpl(){
 async function hwQueueSale(){
  if(hwBusy.has('queueSale'))return;hwBusy.add('queueSale');try{if(!isApprovedUser())throw Error('Sign in first');checkSale(saleDraft.items);validateCommonDraft(saleDraft);if(!saleDraft.operationId)saleDraft.operationId=uid();const scope=hwQueueScope(),entry={key:scope+':'+saleDraft.operationId,scope,operationId:saleDraft.operationId,draft:clone(saleDraft),queuedAt:new Date().toISOString(),error:''};await hwStoreQueueEntry(entry);saleDraft={customer:'',partyId:null,paidInFull:true,amountPaid:0,gstMode:'included',items:[],additionalCharges:[],billDiscount:0};currentScreen='syncQueue';render();hwBusy.delete('queueSale');await hwSyncQueue();}catch(e){alert(e.message);}finally{hwBusy.delete('queueSale');}
 }
-function hwRenderQueue(){return '<div class="card">'+(hwLastSavedSale?'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;"><button class="btn btn-primary" onclick="openPrintPreview(\'sale\',\''+inlineValue(hwLastSavedSale)+'\')">View / print saved bill</button><button class="btn btn-ghost" onclick="shareSaleWhatsApp(\''+inlineValue(hwLastSavedSale)+'\')">WhatsApp</button><button class="btn btn-ghost" onclick="shareSaleBill(\''+inlineValue(hwLastSavedSale)+'\')">Share bill</button></div>':'')+'<h3>Pending sales ('+hwQueue.length+')</h3><p>Pending sales are stored on this device. They appear in the owner portal only after the server confirms them. Stock and the final bill number are assigned during sync.</p><button class="btn btn-primary" onclick="hwSyncQueue()">Retry sync</button><p>'+escapeHtml(hwLastSync)+'</p>'+hwQueue.map(e=>'<div class="list-row"><div><b>'+escapeHtml(e.draft.customer||'Walk-in')+'</b><div>'+escapeHtml(e.queuedAt)+'</div><p>'+escapeHtml(e.reviewing?'Editing pending sale — save it again to resume sync':e.error||'Pending sync')+'</p><button class="btn btn-ghost" onclick="hwReviewPending(\''+inlineValue(e.operationId)+'\')">View pending sale</button><button class="btn btn-ghost" onclick="hwEditPending(\''+inlineValue(e.operationId)+'\')">Check status / edit</button></div></div>').join('')+'</div>';}
+function hwRenderQueue(){return '<div class="card">'+(hwLastSavedSale?'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;"><button class="btn btn-primary" onclick="openPrintPreview(\'sale\',\''+inlineValue(hwLastSavedSale)+'\')">View / print saved bill</button><button class="btn btn-ghost" onclick="shareSaleWhatsApp(\''+inlineValue(hwLastSavedSale)+'\')">WhatsApp</button><button class="btn btn-ghost" onclick="shareSaleBill(\''+inlineValue(hwLastSavedSale)+'\')">Share bill</button></div>':'')+'<h3>Pending sales ('+hwQueue.length+')</h3><p>Pending sales are stored on this device. They appear in the owner portal only after the server confirms them. Stock and the final bill number are assigned during sync.</p><button class="btn btn-primary" onclick="hwSyncQueue()">Retry sync</button><p>'+escapeHtml(hwLastSync)+'</p>'+hwQueue.map(e=>'<div class="list-row"><div><b>'+escapeHtml(e.draft.customer||'Walk-in')+'</b><div>'+escapeHtml(e.queuedAt)+'</div><p>'+escapeHtml(e.reviewing?'Editing pending sale — save it again to resume sync':e.error||'Pending sync')+'</p><button class="btn btn-primary" onclick="openPrintPreview(\'pendingSale\',\''+inlineValue(e.operationId)+'\')">Print / share provisional receipt</button><button class="btn btn-ghost" onclick="hwReviewPending(\''+inlineValue(e.operationId)+'\')">View pending sale</button><button class="btn btn-ghost" onclick="hwEditPending(\''+inlineValue(e.operationId)+'\')">Check status / edit</button></div></div>').join('')+'</div>';}
 function hwReviewPending(id){const entry=hwQueue.find(e=>e.operationId===id);if(!entry)return;alert('Pending sale '+id+'\n'+entry.draft.items.map(i=>i.itemName+': '+i.boxQty+' boxes + '+i.pieceQty+' pieces').join('\n')+'\n\n'+(entry.error||'Awaiting sync')+'\nKeep this entry until its save status is reconciled. Do not create a second sale for the same customer.');}
 async function hwEditPending(id){
  const task=async()=>{if(hwQueueBusy)return;hwQueueBusy=true;try{await hwLoadQueue();const entry=hwQueue.find(e=>e.operationId===id);if(!entry)return;const snap=await fsDB.collection('sales').doc(id).get({source:'server'});if(snap.exists){const record={id:snap.id,...snap.data()};await hwOutbox('readwrite',s=>s.delete(entry.key));upsert('sales',record);hwLastSavedSale=record.id;hwLastSync='Saved '+record.billNo+' to owner portal';await hwLoadQueue();render();return;}entry.reviewing=true;await hwStoreQueueEntry(entry);saleDraft=clone(entry.draft);saleDraft.operationId=entry.operationId;saleScreenMode='new';setScreen('sales');}catch(e){alert('Could not confirm this entry’s status: '+e.message);}finally{hwQueueBusy=false;updateCloudBadge();}};
