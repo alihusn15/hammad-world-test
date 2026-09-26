@@ -490,6 +490,7 @@ const titles = {
   printPreview:['Document','Preview & print'],
   findDuplicates:['Stock check','Duplicates, hidden items & missing products'],
   openingStockHistory:['Opening stock history','Every opening stock entry you saved'],
+  syncQueue:['Sales sync','Device storage and server confirmation'],
   fullLedger:['Ledger','Balances, transactions & cash'],
   openingStockDetail:['Opening stock entry','View & edit this entry']
 };
@@ -2242,7 +2243,7 @@ function initCloudIfConfigured(){
   }
   firebase.auth().onAuthStateChanged(async user=>{
     if(user){
-      hwFullHistory=false;hwQueue=[];
+      hwFullHistory=false;hwQueue=[];hwLastSavedSale=null;hwSaveTiming=null;hwLastSync='';
       currentUserEmail = user.email || '';
       try{
         await hwCacheCleanup;if(hwCacheError)throw Error(hwCacheError);
@@ -2272,7 +2273,7 @@ function initCloudIfConfigured(){
       detachCloudListeners();
       CLOUD_MODE = false;
       serverRole = null;
-      currentUserEmail = '';hwCurrentActor='';hwQueue=[];hwFullHistory=false;for(const c of hwCollections)db[c]=[];
+      currentUserEmail = '';hwCurrentActor='';hwQueue=[];hwFullHistory=false;hwLastSavedSale=null;hwSaveTiming=null;hwLastSync='';for(const c of hwCollections)db[c]=[];
       updateCloudBadge();
       showLoginScreen();
     }
@@ -2416,12 +2417,24 @@ const R2_WORKER_URL    = 'https://hammad-world-test.hammadworld25.workers.dev';
 /* Server-authoritative staff saves (MD-H01/H02 fix): staff bills go through the Worker,
    which re-reads current stock/sale state and recomputes totals/costs/return limits itself,
    instead of trusting whatever the phone sends. Owner saves are unchanged (direct to Firestore). */
-async function hwStaffCall(path,body){
-  const res=await fetch(R2_WORKER_URL+path,{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+await firebase.auth().currentUser.getIdToken()},body:JSON.stringify(body)});
-  const data=await res.json().catch(()=>({}));
-  if(!res.ok)throw Error(data.error||'Could not save. Please try again.');
-  return data;
+async function hwStaffCall(path,body,options={}){
+  const user=firebase.auth().currentUser;
+  if(!user)throw Error('Sign in first.');
+  const token=await user.getIdToken();
+  if(options.scope!=null&&options.scope!==hwQueueScope())throw Error('Account changed before sending.');
+  const controller=options.timeoutMs?new AbortController():null;
+  const timer=controller?setTimeout(()=>controller.abort(),options.timeoutMs):null;
+  try{
+    const res=await fetch(R2_WORKER_URL+path,{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+token},body:JSON.stringify(body),...(controller?{signal:controller.signal}:{})});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok){const error=Error(data.error||'Could not save. Please try again.');error.status=res.status;error.code=data.code;error.retryable=data.retryable;throw error;}
+    return data;
+  }catch(error){
+    if(error.name==='AbortError'){const e=Error('Confirmation is taking longer than expected. This sale is kept on this device; its server status will be checked before another attempt.');e.code='deadline-exceeded';throw e;}
+    throw error;
+  }finally{if(timer)clearTimeout(timer);}
 }
+
 function hwCategoryFields(){return Object.fromEntries(Object.entries(db.categories||{}).map(([k,v])=>[k,{subs:!!(v.subs&&v.subs.length),materials:!!(v.materials&&v.materials.length)}]));}
 
 
@@ -4029,7 +4042,7 @@ document.addEventListener('keydown', function(e){
 });
 
 /* HAMMAD WORLD reliability revision 2026-09-18. Financial amounts are INR. */
-const HW_VERSION='2026.09.25-r28b-test-worker-url';
+const HW_VERSION='2026.09.25-r30-test-worker-sync';
 let hwExpectedLocal=localStorage.getItem(DB_KEY), hwCloudReady=false, hwCloudError='', hwBusy=new Set(), hwPendingOpenings=[];
 const hwCollections=['stock','sales','purchases','saleReturns','purchaseReturns','openingStock','parties','payments','expenses','staff','staffLedger','quotations','auditLog'];
 // Staff subscribe to the shop records needed to verify deliveries and enter bills.
@@ -4075,10 +4088,20 @@ async function resolvePurchaseItems(items,cloud){const seen=new Map();for(const 
 function groupedIncoming(items,landed){const g=Object.create(null);items.forEach((it,i)=>{const x=g[it.sku]||(g[it.sku]={qty:0,value:0,item:it});if(Number(x.item.piecesPerBox)!==Number(it.piecesPerBox))throw Error('One product cannot have different box sizes on the same entry.');x.qty+=units(it,'purchase');x.value+=landed[i];x.item=it;});return g;}
 function incomingStock(s,g,id){if(s?.mergedInto)throw Error('This product was merged. Reload and select the surviving product.');if(s&&Number(s.piecesPerBox)!==Number(g.item.piecesPerBox))throw Error('Use a separate product for a different box size.');const prior=numeric(s?.qty||0,'Current stock');return {...(s&&!isOwner()?{purchaseRate:Number(g.item.rate)}:s?{...productMeta(g.item,id),itemName:s.itemName,category:s.category,subcategory:s.subcategory||'',material:s.material||'',size:s.size||'',batch:s.batch||'',piecesPerBox:Number(s.piecesPerBox)}:productMeta(g.item,id)),...(!s?{_historyTracked:true}:{}),qty:prior+g.qty,avgCost:(prior* (s?avgOf(s):0)+g.value)/(prior+g.qty)};}
 function assertTxnSize(ids){if(ids.length>400)throw Error('Split this entry into batches of at most 400 different products. There is no limit on the number of bills.');}
-async function saveSale(){return guarded('sale',async()=>{checkSale(saleDraft.items);validateCommonDraft(saleDraft);const d=clone(saleDraft);if(d.fromQuoteId&&!canPerform('quotation'))throw Error('Quotation conversion is restricted to approved accounts.');d.items=ensureLines(d.items);for(const it of d.items){const s=stockById(it.stockId);if(!s)throw Error('Product no longer exists.');it.stockId=s.id;}const totals=saleTotals(d.items,d),needs=aggregateSaleNeeds(d.items);if(!saleDraft.operationId)saleDraft.operationId=uid();const operationId=saleDraft.operationId;let saved;
- if(CLOUD_MODE&&!isServerOwner()){saved=await hwStaffCall('/staff/sale',{operationId,items:d.items.map(it=>({stockId:it.stockId,boxQty:it.boxQty,pieceQty:it.pieceQty,boxPrice:it.boxPrice,piecePrice:it.piecePrice,discount:it.discount,gst:it.gst,lineId:it.lineId})),billDiscount:d.billDiscount,billDiscountPct:d.billDiscountPct,amountPaid:d.amountPaid,additionalCharges:d.additionalCharges,partyId:d.partyId,gstMode:d.gstMode,customer:d.customer,paidInFull:d.paidInFull,fromQuoteId:d.fromQuoteId,actorName:hwCurrentActor||currentUserEmail});upsert('sales',saved);}
- else if(CLOUD_MODE){const billNo=await nextBillNoCloud('sale'),ref=fsDB.collection('sales').doc(operationId);await fsDB.runTransaction(async tx=>{const existing=await tx.get(ref);if(existing.exists){saved={id:ref.id,...existing.data()};return;}const ids=Object.keys(needs);assertTxnSize(ids);const refs=ids.map(id=>fsDB.collection('stock').doc(id));const snaps=await Promise.all(refs.map(r=>tx.get(r)));let quoteSnap=null,quoteRef=null;if(d.fromQuoteId){quoteRef=fsDB.collection('quotations').doc(d.fromQuoteId);quoteSnap=await tx.get(quoteRef);if(!quoteSnap.exists||quoteSnap.data().status==='converted')throw Error('This quotation is already converted or missing.');}const info={};snaps.forEach((s,i)=>{if(!s.exists||s.data().mergedInto||s.data().qty<needs[ids[i]])throw Error('Not enough stock; reload the product list.');info[ids[i]]=s.data();});d.items.forEach(it=>it.costAtSale=avgOf(info[it.stockId]));saved={id:ref.id,billNo,date:todayStr(),customer:d.customer||'Walk-in',partyId:d.partyId||null,items:d.items,gstMode:d.gstMode,additionalCharges:d.additionalCharges||[],...totals,amountPaid:d.partyId&&d.paidInFull===false?amount(d.amountPaid||0):totals.totalAmount,rev:0,_returnedByLine:{},_returnSeeded:true,operationId,sourceQuoteId:d.fromQuoteId||null,...actorFields(),stockChanges:stockChanges(needs,-1),createdAt:firebase.firestore.FieldValue.serverTimestamp()};refs.forEach((r,i)=>tx.update(r,staffStockUpdate(info[ids[i]].qty-needs[ids[i]],operationId,'sales')));tx.set(ref,saved);if(quoteRef)tx.update(quoteRef,{status:'converted',convertedToBill:billNo,convertedSaleId:operationId});});upsert('sales',saved);}
- else localCommit(state=>{if(d.fromQuoteId){const q=state.quotations.find(q=>q.id===d.fromQuoteId);if(!q||q.status==='converted')throw Error('This quotation is already converted or missing.');}for(const [id,need]of Object.entries(needs)){if(stockById(id,state).qty<need)throw Error('Not enough stock for this sale.');}d.items.forEach(it=>it.costAtSale=avgOf(stockById(it.stockId,state)));const id=nextId('SAL'),billNo=nextBillNo('sale');saved={id,billNo,date:todayStr(),customer:d.customer||'Walk-in',partyId:d.partyId||null,items:d.items,gstMode:d.gstMode,additionalCharges:d.additionalCharges||[],...totals,amountPaid:d.partyId&&d.paidInFull===false?amount(d.amountPaid||0):totals.totalAmount,rev:0,_returnedByLine:{},_returnSeeded:true,operationId,sourceQuoteId:d.fromQuoteId||null};for(const [sid,need]of Object.entries(needs))Object.assign(stockById(sid,state),{qty:stockById(sid,state).qty-need,_hasDownstream:true});state.sales.push(saved);if(d.fromQuoteId)Object.assign(state.quotations.find(q=>q.id===d.fromQuoteId),{status:'converted',convertedToBill:billNo,convertedSaleId:id});auditIn(state,'Sale created',billNo);});saleDraft={customer:'',partyId:null,paidInFull:true,amountPaid:0,gstMode:'included',items:[],additionalCharges:[],billDiscount:0};syncCatalogItem();openPrintPreview('sale',saved.id);});}
+async function hwCommitSale(draft,scope=null){
+ const assertSession=()=>{if(scope!==null&&scope!==hwQueueScope())throw Error('Account changed. Sign in with the original account to reconcile this sale.');};assertSession();
+ const d=clone(draft);try{checkSale(d.items);validateCommonDraft(d);if(d.fromQuoteId&&!canPerform('quotation'))throw Error('Quotation conversion is restricted to approved accounts.');d.items=ensureLines(d.items);for(const it of d.items){const s=stockById(it.stockId);if(!s)throw Error('Product no longer exists.');it.stockId=s.id;}}catch(e){e.notDispatched=true;throw e;}const totals=saleTotals(d.items,d),needs=aggregateSaleNeeds(d.items);if(!draft.operationId)draft.operationId=uid();const operationId=draft.operationId;let saved;
+ if(CLOUD_MODE&&!isServerOwner()){saved=await hwStaffCall('/staff/sale',{operationId,items:d.items.map(it=>({stockId:it.stockId,boxQty:it.boxQty,pieceQty:it.pieceQty,boxPrice:it.boxPrice,piecePrice:it.piecePrice,discount:it.discount,gst:it.gst,lineId:it.lineId})),billDiscount:d.billDiscount,billDiscountPct:d.billDiscountPct,amountPaid:d.amountPaid,additionalCharges:d.additionalCharges,partyId:d.partyId,gstMode:d.gstMode,customer:d.customer,paidInFull:d.paidInFull,fromQuoteId:d.fromQuoteId,actorName:hwCurrentActor||currentUserEmail},scope===null?{}:{scope,timeoutMs:30000});}
+ else if(CLOUD_MODE){const billNo=await nextBillNoCloud('sale'),ref=fsDB.collection('sales').doc(operationId);assertSession();await fsDB.runTransaction(async tx=>{assertSession();const ids=Object.keys(needs);assertTxnSize(ids);const refs=ids.map(id=>fsDB.collection('stock').doc(id)),quoteRef=d.fromQuoteId?fsDB.collection('quotations').doc(d.fromQuoteId):null;const [existing,snaps,quoteSnap]=await Promise.all([tx.get(ref),Promise.all(refs.map(r=>tx.get(r))),quoteRef?tx.get(quoteRef):Promise.resolve(null)]);if(existing.exists){saved={id:ref.id,...existing.data()};return;}if(quoteRef&&(!quoteSnap.exists||quoteSnap.data().status==='converted'))throw Error('This quotation is already converted or missing.');assertSession();const info={};snaps.forEach((s,i)=>{if(!s.exists||s.data().mergedInto||s.data().qty<needs[ids[i]])throw Error('Not enough stock; reload the product list.');info[ids[i]]=s.data();});d.items.forEach(it=>it.costAtSale=avgOf(info[it.stockId]));saved={id:ref.id,billNo,date:todayStr(),customer:d.customer||'Walk-in',partyId:d.partyId||null,items:d.items,gstMode:d.gstMode,additionalCharges:d.additionalCharges||[],...totals,amountPaid:d.partyId&&d.paidInFull===false?amount(d.amountPaid||0):totals.totalAmount,rev:0,_returnedByLine:{},_returnSeeded:true,operationId,sourceQuoteId:d.fromQuoteId||null,...actorFields(),stockChanges:stockChanges(needs,-1),createdAt:firebase.firestore.FieldValue.serverTimestamp()};refs.forEach((r,i)=>tx.update(r,staffStockUpdate(info[ids[i]].qty-needs[ids[i]],operationId,'sales')));tx.set(ref,saved);if(quoteRef)tx.update(quoteRef,{status:'converted',convertedToBill:billNo,convertedSaleId:operationId});});}
+ else localCommit(state=>{if(d.fromQuoteId){const q=state.quotations.find(q=>q.id===d.fromQuoteId);if(!q||q.status==='converted')throw Error('This quotation is already converted or missing.');}for(const [id,need]of Object.entries(needs)){if(stockById(id,state).qty<need)throw Error('Not enough stock for this sale.');}d.items.forEach(it=>it.costAtSale=avgOf(stockById(it.stockId,state)));const id=nextId('SAL'),billNo=nextBillNo('sale');saved={id,billNo,date:todayStr(),customer:d.customer||'Walk-in',partyId:d.partyId||null,items:d.items,gstMode:d.gstMode,additionalCharges:d.additionalCharges||[],...totals,amountPaid:d.partyId&&d.paidInFull===false?amount(d.amountPaid||0):totals.totalAmount,rev:0,_returnedByLine:{},_returnSeeded:true,operationId,sourceQuoteId:d.fromQuoteId||null};for(const [sid,need]of Object.entries(needs))Object.assign(stockById(sid,state),{qty:stockById(sid,state).qty-need,_hasDownstream:true});state.sales.push(saved);if(d.fromQuoteId)Object.assign(state.quotations.find(q=>q.id===d.fromQuoteId),{status:'converted',convertedToBill:billNo,convertedSaleId:id});auditIn(state,'Sale created',billNo);});
+ assertSession();return saved;
+}
+async function saveSale(){return guarded('sale',async()=>{
+ const saved=await hwCommitSale(saleDraft);upsert('sales',saved);
+ saleDraft={customer:'',partyId:null,paidInFull:true,amountPaid:0,gstMode:'included',items:[],additionalCharges:[],billDiscount:0};
+ syncCatalogItem();openPrintPreview('sale',saved.id);
+});}
+
 async function saveSaleCloud(){return saveSale();}
 async function savePurchase(){return guarded('purchase',async()=>{checkPurchase(purchaseDraft.items);validateCommonDraft(purchaseDraft);const d=clone(purchaseDraft);if(!purchaseDraft.operationId)purchaseDraft.operationId=uid();const operationId=purchaseDraft.operationId;let saved;
  if(CLOUD_MODE&&!isServerOwner()){saved=await hwStaffCall('/staff/purchase',{operationId,supplier:d.supplier,supplierBillNo:d.supplierBillNo,partyId:d.partyId,gstMode:d.gstMode,items:d.items.map(it=>({sku:it.sku||null,itemName:it.itemName,category:it.category,subcategory:it.subcategory,material:it.material,size:it.size,brand:it.brand,batch:it.batch,piecesPerBox:it.piecesPerBox,qty:it.qty,freeQty:it.freeQty,pieceQty:it.pieceQty,freePieceQty:it.freePieceQty,rate:it.rate,mrp:it.mrp,gst:it.gst})),additionalCharges:d.additionalCharges,actualAmountPaid:d.actualAmountPaid,actualAmountPaidExplicit:d.actualAmountPaid!==''&&d.actualAmountPaid!=null,paidInFull:d.paidInFull,amountPaid:d.amountPaid,categoryFields:hwCategoryFields(),actorName:hwCurrentActor||currentUserEmail});upsert('purchases',saved);}
@@ -4273,26 +4296,122 @@ function hwQueueScope(){return (getStoredConfig()?.projectId||'')+':'+(firebase.
 async function hwOutbox(mode,fn){return new Promise((resolve,reject)=>{const request=indexedDB.open('hw-entry-outbox-v1',1);request.onupgradeneeded=()=>request.result.createObjectStore('entries',{keyPath:'key'});request.onerror=()=>reject(request.error);request.onsuccess=()=>{const handle=request.result,tx=handle.transaction('entries',mode),store=tx.objectStore('entries');let result;try{result=fn(store);}catch(e){handle.close();reject(e);return;}tx.oncomplete=()=>{handle.close();resolve(result?.result);};tx.onerror=()=>{handle.close();reject(tx.error);};tx.onabort=()=>{handle.close();reject(tx.error||Error('Pending entry could not be stored'));};};});}
 async function hwLoadQueue(){const scope=hwQueueScope(),entries=await hwOutbox('readonly',s=>s.getAll());if(scope!==hwQueueScope())return;hwQueue=entries.filter(e=>e.scope===scope);updateCloudBadge();}
 async function hwStoreQueueEntry(entry){await hwOutbox('readwrite',s=>s.put(entry));await hwLoadQueue();}
-async function hwSyncQueue(){if(navigator.locks)return navigator.locks.request('hw-outbox:'+hwQueueScope(),{ifAvailable:true},lock=>lock?hwSyncQueueImpl():undefined);return hwSyncQueueImpl();}
-async function hwSyncQueueImpl(){
- if(hwQueueBusy||!navigator.onLine||!isApprovedUser()||!CLOUD_MODE||!hwCloudReady)return;hwQueueBusy=true;const scope=hwQueueScope();
- try{await hwLoadQueue();for(const entry of [...hwQueue]){if(scope!==hwQueueScope())break;if(entry.reviewing)continue;try{
-  const ref=fsDB.collection('sales').doc(entry.operationId);let saved=await ref.get({source:'server'});
-  if(!saved.exists){const original=saleDraft;saleDraft=clone(entry.draft);try{await hwLocalSaveSale();}finally{saleDraft=original;}saved=await ref.get({source:'server'});}
-  if(!saved.exists)throw Error('The sale was not confirmed. Check stock and retry this pending entry.');
-  await hwOutbox('readwrite',store=>store.delete(entry.key));if(scope!==hwQueueScope())break;
-  const bill={id:saved.id,...saved.data()};upsert('sales',bill);hwLastSavedSale=bill.id;hwLastSync='Saved '+bill.billNo+' to owner portal';syncCatalogItem();
- }catch(e){entry.error=e.message;await hwStoreQueueEntry(entry);break;}}}
- finally{hwQueueBusy=false;await hwLoadQueue();updateCloudBadge();safeRender();}
+// r29: immutable queued drafts; durable acknowledgement; retries reconcile uncertain saves.
+let hwQueueTimer=null,hwQueueWakeAt=0,hwActiveQueueId='',hwSaveTiming=null;
+function hwScheduleQueue(delay=1000){
+ const at=Date.now()+delay;if(hwQueueTimer&&hwQueueWakeAt<=at)return;
+ clearTimeout(hwQueueTimer);hwQueueWakeAt=at;
+ hwQueueTimer=setTimeout(()=>{hwQueueTimer=null;hwQueueWakeAt=0;hwSyncQueue();},delay);
+}
+function hwQueueDisplay(){updateCloudBadge();if(currentScreen==='syncQueue')safeRender();}
+async function hwSyncQueue(manual=false){
+ try{
+  if(navigator.locks){
+   return await navigator.locks.request('hw-outbox:'+hwQueueScope(),{ifAvailable:true},async lock=>{
+    if(lock)return hwSyncQueueImpl(manual);
+    if(hwQueue.length)hwScheduleQueue(2500);
+   });
+  }
+  // Browsers without Web Locks do not dispatch new attempts. This avoids two tabs sending the same staff request concurrently.
+  if(hwQueue.length){hwLastSync='Open this test app in a current HTTPS browser to enable safe multi-tab syncing.';hwQueueDisplay();}
+ }catch(e){hwLastSync='Pending sales remain on this device: '+e.message;hwQueueDisplay();}
+}
+function hwConfirmedSale(value,id){return !!value&&value.id===id&&typeof value.billNo==='string'&&!!value.billNo&&Array.isArray(value.items)&&Number.isFinite(Number(value.totalAmount));}
+async function hwReadSale(id){const snap=await fsDB.collection('sales').doc(id).get({source:'server'});return snap.exists?{...snap.data(),id:snap.id}:null;}
+async function hwSyncQueueImpl(manual=false){
+ if(hwQueueBusy||!navigator.onLine||!isApprovedUser()||!CLOUD_MODE||!hwCloudReady||hwCloudError)return;
+ if(hwBusy.size){hwScheduleQueue(1000);return;}
+ if(hasPendingOpening()){hwLastSync='Finish the opening-stock import before syncing sales.';hwQueueDisplay();return;}
+ hwQueueBusy=true;hwBusy.add('saleSync');const scope=hwQueueScope();
+ try{
+  await hwLoadQueue();
+  for(const entry of [...hwQueue].sort((a,b)=>a.queuedAt.localeCompare(b.queuedAt))){
+   if(scope!==hwQueueScope()||!navigator.onLine||!hwCloudReady)break;
+   if(entry.reviewing)continue;
+   if(entry.blocked&&!manual)continue;
+   if(!manual&&entry.nextAttemptAt>Date.now()){hwScheduleQueue(entry.nextAttemptAt-Date.now());break;}
+   hwActiveQueueId=entry.operationId;hwQueueDisplay();const started=performance.now();
+   try{
+    // Fresh r29 drafts need no preliminary network read. Legacy entries and
+    // every previously dispatched request are reconciled before further action.
+    let bill=entry.attempted===false?null:await hwReadSale(entry.operationId);
+    if(scope!==hwQueueScope())break;
+    if(!bill){
+     // The supplied Worker verifies the operation ID inside its atomic transaction.
+     // Retrying the unchanged draft can recover an ambiguous request without double stock deduction.
+     entry.attempted=true;entry.uncertain=true;entry.error='';entry.blocked=false;
+     await hwStoreQueueEntry(entry);
+     if(scope!==hwQueueScope())break;
+     bill=await hwCommitSale(clone(entry.draft),scope);
+     // A malformed acknowledgement must never discard the durable draft.
+     if(!hwConfirmedSale(bill,entry.operationId))bill=await hwReadSale(entry.operationId);
+    }
+    if(scope!==hwQueueScope())break;
+    if(!hwConfirmedSale(bill,entry.operationId))throw Error('The server did not return a valid confirmed bill. Keep this pending entry for a status check.');
+    await hwOutbox('readwrite',store=>store.delete(entry.key));
+    if(scope!==hwQueueScope())break;
+    upsert('sales',bill);hwLastSavedSale=bill.id;
+    hwSaveTiming={billNo:bill.billNo,workerMs:Number.isFinite(bill._sync?.workerMs)?bill._sync.workerMs:null,localMs:entry.localMs??null,confirmMs:Math.round(performance.now()-started),elapsedMs:Math.max(0,Date.now()-Date.parse(entry.queuedAt))};
+    hwLastSync='Confirmed '+bill.billNo+' · saved to Firebase';
+    await hwLoadQueue();hwQueueDisplay();
+    try{syncCatalogItem();}catch(e){console.error('Catalogue refresh deferred',e);}
+   }catch(e){
+    if(scope!==hwQueueScope())break;
+    entry.error=e.message||String(e);entry.attempts=(entry.attempts||0)+1;
+    const definiteRejection=e.notDispatched||[400,401,403,404,409,422].includes(e.status)||/Not enough stock|Product no longer exists|already converted or missing|Select an existing party|Account changed/.test(entry.error);
+    if(definiteRejection)entry.uncertain=false;
+    const transient=e.retryable!==false&&(['unavailable','deadline-exceeded','aborted','confirmation-unknown'].some(code=>String(e.code||'').toLowerCase().endsWith(code))||e instanceof TypeError||[429,500,502,503,504].includes(e.status));
+    entry.blocked=!transient||entry.attempts>=3;
+    const delay=Math.min(30000,1500*2**(entry.attempts-1));
+    entry.nextAttemptAt=Date.now()+delay;
+    await hwStoreQueueEntry(entry);
+    hwLastSync=entry.uncertain?'Awaiting confirmation — pending entry retained.':'Sale needs attention — open the pending entry.';
+    if(!entry.blocked)hwScheduleQueue(delay);
+    break;
+   }finally{hwActiveQueueId='';}
+  }
+ }finally{
+  hwQueueBusy=false;hwBusy.delete('saleSync');hwActiveQueueId='';
+  await hwLoadQueue();if(scope===hwQueueScope()){hwQueueDisplay();const next=hwQueue.filter(e=>!e.reviewing&&!e.blocked);if(next.length)hwScheduleQueue(Math.max(250,Math.min(...next.map(e=>e.nextAttemptAt||0))-Date.now()));}
+ }
 }
 async function hwQueueSale(){
- if(hwBusy.has('queueSale'))return;hwBusy.add('queueSale');try{if(!isApprovedUser())throw Error('Sign in first');checkSale(saleDraft.items);validateCommonDraft(saleDraft);if(!saleDraft.operationId)saleDraft.operationId=uid();const scope=hwQueueScope(),entry={key:scope+':'+saleDraft.operationId,scope,operationId:saleDraft.operationId,draft:clone(saleDraft),queuedAt:new Date().toISOString(),error:''};await hwStoreQueueEntry(entry);saleDraft={customer:'',partyId:null,paidInFull:true,amountPaid:0,gstMode:'included',items:[],additionalCharges:[],billDiscount:0};currentScreen='syncQueue';render();hwBusy.delete('queueSale');await hwSyncQueue();}catch(e){alert(e.message);}finally{hwBusy.delete('queueSale');}
+ if(hwBusy.has('queueSale'))return;hwBusy.add('queueSale');const started=performance.now();
+ try{
+  if(!isApprovedUser())throw Error('Sign in first');
+  if(!isServerOwner()&&saleDraft.items.length>40)throw Error('A staff sale supports up to 40 lines. Split this bill; nothing has been saved.');
+  checkSale(saleDraft.items);validateCommonDraft(saleDraft);
+  if(!saleDraft.operationId)saleDraft.operationId=uid();
+  const scope=hwQueueScope(),draft=clone(saleDraft),key=scope+':'+draft.operationId;
+  const enqueue=async()=>{
+  const prior=await hwOutbox('readonly',store=>store.get(key));
+  if(prior&&!prior.reviewing)throw Error('This sale is already pending. Check its status instead of saving it again.');
+  if(scope!==hwQueueScope())throw Error('Account changed. Sign in again before saving.');
+  const entry={key,scope,operationId:draft.operationId,draft,queuedAt:prior?.queuedAt||new Date().toISOString(),error:'',attempted:false,uncertain:false,attempts:0};
+  await hwOutbox('readwrite',store=>store.put(entry));
+  const localMs=Math.round(performance.now()-started);entry.localMs=localMs;
+  // Only clear after the IndexedDB transaction completes successfully.
+  if(scope!==hwQueueScope())return;
+  saleDraft={customer:'',partyId:null,paidInFull:true,amountPaid:0,gstMode:'included',items:[],additionalCharges:[],billDiscount:0};
+  hwLastSavedSale=null;hwSaveTiming=null;hwLastSync='Saved on this device in '+localMs+' ms · awaiting server confirmation';
+  await hwLoadQueue();const queued=hwQueue.find(e=>e.key===key);if(queued)queued.localMs=localMs;
+  setScreen('syncQueue');hwScheduleQueue(0);
+  };
+  if(navigator.locks)await navigator.locks.request('hw-draft:'+key,enqueue);else await enqueue();
+ }catch(e){alert(e.message);}finally{hwBusy.delete('queueSale');}
 }
-function hwRenderQueue(){return '<div class="card">'+(hwLastSavedSale?'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;"><button class="btn btn-primary" onclick="openPrintPreview(\'sale\',\''+inlineValue(hwLastSavedSale)+'\')">View / print saved bill</button><button class="btn btn-ghost" onclick="shareSaleWhatsApp(\''+inlineValue(hwLastSavedSale)+'\')">WhatsApp</button><button class="btn btn-ghost" onclick="shareSaleBill(\''+inlineValue(hwLastSavedSale)+'\')">Share bill</button></div>':'')+'<h3>Pending sales ('+hwQueue.length+')</h3><p>Pending sales are stored on this device. They appear in the owner portal only after the server confirms them. Stock and the final bill number are assigned during sync.</p><button class="btn btn-primary" onclick="hwSyncQueue()">Retry sync</button><p>'+escapeHtml(hwLastSync)+'</p>'+hwQueue.map(e=>'<div class="list-row"><div><b>'+escapeHtml(e.draft.customer||'Walk-in')+'</b><div>'+escapeHtml(e.queuedAt)+'</div><p>'+escapeHtml(e.reviewing?'Editing pending sale — save it again to resume sync':e.error||'Pending sync')+'</p><button class="btn btn-primary" onclick="openPrintPreview(\'pendingSale\',\''+inlineValue(e.operationId)+'\')">Print / share provisional receipt</button><button class="btn btn-ghost" onclick="hwReviewPending(\''+inlineValue(e.operationId)+'\')">View pending sale</button><button class="btn btn-ghost" onclick="hwEditPending(\''+inlineValue(e.operationId)+'\')">Check status / edit</button></div></div>').join('')+'</div>';}
+function hwRenderQueue(){
+ const timing=hwSaveTiming?'<div class="step">Last confirmation attempt: '+(hwSaveTiming.confirmMs/1000).toFixed(2)+' s · total time since queued: '+(hwSaveTiming.elapsedMs/1000).toFixed(2)+' s.'+(hwSaveTiming.workerMs!=null?' Worker processing: '+(hwSaveTiming.workerMs/1000).toFixed(2)+' s.':'')+' Includes network and server time.</div>':'';
+ return '<div class="card"><h3>Sales sync</h3><p role="status" aria-live="polite">'+escapeHtml(hwLastSync||'No sales waiting on this device.')+'</p>'+timing+
+ (hwLastSavedSale?'<button class="btn btn-primary" onclick="openPrintPreview(\'sale\',\''+inlineValue(hwLastSavedSale)+'\')">View / print confirmed bill</button><div class="row2" style="margin-top:8px"><button class="btn btn-ghost" onclick="shareSaleWhatsApp(\''+inlineValue(hwLastSavedSale)+'\')">WhatsApp</button><button class="btn btn-ghost" onclick="shareSaleBill(\''+inlineValue(hwLastSavedSale)+'\')">Share bill</button></div>':'')+
+ '<button class="btn btn-ghost" style="margin-top:10px" onclick="saleScreenMode=\'new\';setScreen(\'sales\')">Continue billing</button></div><div class="card"><h3>Pending sales ('+hwQueue.length+')</h3><p>Saved on this device is not the final bill. Only a confirmed sale has its final bill number and stock deduction. Keep this browser’s data until every entry is confirmed.</p><button class="btn btn-primary" onclick="hwSyncQueue(true)" '+(hwQueueBusy?'disabled':'')+'>'+(hwQueueBusy?'Checking / syncing…':'Check status / retry')+'</button>'+
+ hwQueue.map(e=>'<div class="list-row"><div style="width:100%"><b>'+escapeHtml(e.draft.customer||'Walk-in')+'</b><div class="step">'+escapeHtml(new Date(e.queuedAt).toLocaleString())+'</div><p>'+escapeHtml(e.operationId===hwActiveQueueId?'Waiting for server confirmation…':e.reviewing?'Editing paused sale — save it again to resume sync':e.error||(!navigator.onLine?'Saved on device · waiting for internet':'Saved on device · waiting to sync'))+'</p><button class="btn btn-ghost" onclick="hwReviewPending(\''+inlineValue(e.operationId)+'\')">View pending sale</button><button class="btn btn-ghost" style="margin-top:6px" onclick="openPrintPreview(\'pendingSale\',\''+inlineValue(e.operationId)+'\')">Provisional receipt</button><button class="btn btn-ghost" style="margin-top:6px" '+(hwQueueBusy?'disabled':'')+' onclick="hwEditPending(\''+inlineValue(e.operationId)+'\')">Check status / edit</button></div></div>').join('')+'</div>';
+}
+
 function hwReviewPending(id){const entry=hwQueue.find(e=>e.operationId===id);if(!entry)return;alert('Pending sale '+id+'\n'+entry.draft.items.map(i=>i.itemName+': '+i.boxQty+' boxes + '+i.pieceQty+' pieces').join('\n')+'\n\n'+(entry.error||'Awaiting sync')+'\nKeep this entry until its save status is reconciled. Do not create a second sale for the same customer.');}
 async function hwEditPending(id){
- const task=async()=>{if(hwQueueBusy)return;hwQueueBusy=true;try{await hwLoadQueue();const entry=hwQueue.find(e=>e.operationId===id);if(!entry)return;const snap=await fsDB.collection('sales').doc(id).get({source:'server'});if(snap.exists){const record={id:snap.id,...snap.data()};await hwOutbox('readwrite',s=>s.delete(entry.key));upsert('sales',record);hwLastSavedSale=record.id;hwLastSync='Saved '+record.billNo+' to owner portal';await hwLoadQueue();render();return;}entry.reviewing=true;await hwStoreQueueEntry(entry);saleDraft=clone(entry.draft);saleDraft.operationId=entry.operationId;saleScreenMode='new';setScreen('sales');}catch(e){alert('Could not confirm this entry’s status: '+e.message);}finally{hwQueueBusy=false;updateCloudBadge();}};
- if(navigator.locks)return navigator.locks.request('hw-outbox:'+hwQueueScope(),{ifAvailable:true},lock=>lock?task():alert('Another tab is syncing. Try again after it finishes.'));return task();
+ const task=async()=>{if(hwQueueBusy)return;hwQueueBusy=true;try{await hwLoadQueue();const entry=hwQueue.find(e=>e.operationId===id);if(!entry)return;const snap=await fsDB.collection('sales').doc(id).get({source:'server'});if(snap.exists){const record={id:snap.id,...snap.data()};await hwOutbox('readwrite',s=>s.delete(entry.key));upsert('sales',record);hwLastSavedSale=record.id;hwLastSync='Saved '+record.billNo+' to owner portal';await hwLoadQueue();render();return;}if(entry.uncertain&&!isServerOwner())throw Error('This request may still be processing. Check status again; it cannot safely be edited until the Worker result is known.');entry.reviewing=true;await hwStoreQueueEntry(entry);saleDraft=clone(entry.draft);saleDraft.operationId=entry.operationId;saleScreenMode='new';setScreen('sales');}catch(e){alert('Could not confirm this entry’s status: '+e.message);}finally{hwQueueBusy=false;updateCloudBadge();}};
+ if(navigator.locks)return navigator.locks.request('hw-outbox:'+hwQueueScope(),{ifAvailable:true},lock=>lock?task():alert('Another tab is syncing. Try again after it finishes.'));return alert('Use a current HTTPS browser to safely edit pending sales.');
 }
 const hwLocalSaveSale=saveSale;
 saveSale=function(){return CLOUD_MODE?hwQueueSale():hwLocalSaveSale();};window.saveSale=saveSale;
@@ -4339,8 +4458,9 @@ render=function(){const main=document.getElementById('main');if(!CLOUD_MODE)retu
 const hwOldSettings=renderShopSettings;
 renderShopSettings=function(){return hwOldSettings()+'<div class="card"><h3>Economy mode and shop staff access</h3><p>Routine startup loads stock, parties and this month’s entries. Complete financial history is loaded only when requested. Shop staff see purchase bills and stock. Saves check current server stock.</p><p>Public catalogue rebuilds are spaced at least 15 minutes apart. This does not delay entries in the owner portal.</p><button class="btn btn-ghost" onclick="setScreen(\'syncQueue\')">Pending sales</button></div>';};window.renderShopSettings=renderShopSettings;
 const hwOldCloudBadge=updateCloudBadge;
-updateCloudBadge=function(){hwOldCloudBadge();const el=document.getElementById('cloudBadge');if(!el||!CLOUD_MODE)return;el.onclick=()=>setScreen('syncQueue');el.textContent=hwQueueBusy?'Syncing entries…':hwQueue.length?hwQueue.length+' pending sync':!navigator.onLine?'Offline — sales can queue':hwCloudError?'Sync needs attention':!hwCloudReady?'Connecting…':'Connected · entries synced';el.classList.toggle('offline',!!hwQueue.length||!navigator.onLine||!!hwCloudError);};
+updateCloudBadge=function(){hwOldCloudBadge();const el=document.getElementById('cloudBadge');if(!el||!CLOUD_MODE)return;el.onclick=()=>setScreen('syncQueue');el.textContent=hwQueueBusy?'Confirming sale…':hwQueue.length?hwQueue.length+' pending sync':!navigator.onLine?'Offline — sales can queue':hwCloudError?'Sync needs attention':!hwCloudReady?'Connecting…':'Connected · entries synced';el.classList.toggle('offline',!!hwQueue.length||!navigator.onLine||!!hwCloudError);};
 window.addEventListener('online',()=>{hwSyncQueue();});
+window.addEventListener('focus',()=>{if(CLOUD_MODE&&isApprovedUser())hwLoadQueue().then(()=>{hwQueueDisplay();hwSyncQueue();}).catch(e=>console.error(e));});
 window.addEventListener('offline',()=>{updateCloudBadge();});
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)hwSyncQueue();});
 const hwOldPrint=renderPrintPreview;
